@@ -6314,10 +6314,9 @@ void streamKeyRemoved(redisDb *db, robj *key, robj *val) {
  * For each database, it iterates through the stream_idmp_keys dictionary.
  * For each tracked stream, it compares the wall-clock recording time of the
  * entries in the stream's idmp linked list against the expiration threshold
- * (current time - idmp_duration).
- * Entries with a recording time older than the threshold are removed from the head
- * of the linked list. When all entries have been removed and the list becomes empty,
- * the stream key is removed from stream_idmp_keys to stop tracking it. */
+ * (current time - idmp_duration) and removes every entry outside its window.
+ * When all entries have been removed and the list becomes empty, the stream
+ * key is removed from stream_idmp_keys to stop tracking it. */
 void handleExpiredIdmpEntries(void) {
     static unsigned int current_db = 0;
     int dbs_per_call = CRON_DBS_PER_CALL;
@@ -6361,23 +6360,37 @@ void handleExpiredIdmpEntries(void) {
             while (raxNext(&ri)) {
                 idmpProducer *producer = ri.data;
                 
-                /* Remove expired entries from the head of this producer's linked list */
-                while (producer->idmp_head != NULL) {
-                    idmpEntry *entry = producer->idmp_head;
+                /* Drop every entry outside its deduplication window. The list
+                 * is normally ordered by insertion time, so expired entries
+                 * form a prefix and we could stop at the first live one. But
+                 * insert_time comes from the wall clock, which is not
+                 * monotonic: a backward step can leave an expired entry behind
+                 * a live one. Walk the whole list instead of assuming a
+                 * prefix, exactly like the RDB saver, so such an entry cannot
+                 * survive in idmp_dict and keep winning dedup lookups. */
+                idmpEntry *prev = NULL;
+                idmpEntry *entry = producer->idmp_head;
+                while (entry != NULL) {
+                    idmpEntry *next = entry->next;
                     if (entry->insert_time <= expire_time) {
                         /* Remove from dict */
                         dictDelete(producer->idmp_dict, entry);
-                        /* Remove from linked list head */
-                        producer->idmp_head = entry->next;
-                        if (producer->idmp_head == NULL) {
-                            producer->idmp_tail = NULL;
+                        /* Unlink from the list */
+                        if (prev != NULL) {
+                            prev->next = next;
+                        } else {
+                            producer->idmp_head = next;
+                        }
+                        if (producer->idmp_tail == entry) {
+                            producer->idmp_tail = prev;
                         }
                         /* Free the entry */
                         idmpEntryFree(entry, &s->alloc_size);
                         modified = 1;
                     } else {
-                        break;
+                        prev = entry;
                     }
+                    entry = next;
                 }
 
                 /* If this producer has no entries left, remove it from the rax tree */
